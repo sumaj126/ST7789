@@ -13,6 +13,7 @@
 #include <Adafruit_ST7789.h>
 #include <DHT.h>
 #include <U8g2_for_Adafruit_GFX.h>
+#include "esp_task_wdt.h"  // 看门狗
 
 // ========================== 1. 基础配置 ==========================
 const char* ssid = "jiajia";
@@ -49,7 +50,10 @@ U8G2_FOR_ADAFRUIT_GFX u8g2;
 
 // NTP配置
 WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "ntp.aliyun.com", 28800, 60000);
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 28800, 60000);  // 使用更稳定的NTP服务器
+
+// 看门狗配置
+#define WDT_TIMEOUT 8  // 看门狗超时时间(秒)
 
 // 全局变量
 const unsigned long tempRefreshInterval = 5000;
@@ -57,6 +61,10 @@ const unsigned long clockRefreshInterval = 1000;
 unsigned long lastTempRefreshTime = 0;
 unsigned long lastClockRefreshTime = 0;
 unsigned long lastSeconds = 255;  // 用于检测秒数变化
+unsigned long lastWiFiCheckTime = 0;
+const unsigned long wifiCheckInterval = 30000;  // WiFi检查间隔30秒
+unsigned long bootCount = 0;
+unsigned long systemUptime = 0;
 
 // ========================== 2. 函数前置声明 ==========================
 void drawBeautifulBorder();
@@ -68,10 +76,50 @@ void getCenterPos(U8G2_FOR_ADAFRUIT_GFX &u8g2_obj, const char* str,
                  int &out_x, int &out_y);
 void drawRoundedRect(int x, int y, int w, int h, int r, uint16_t color);
 void drawGradientBackground();
-void drawIcon(int x, int y, const char* type, uint16_t color);
-void drawClockIcon(int x, int y, uint16_t color);
+void checkAndReconnectWiFi();
+void feedWatchdog();
 
 // ========================== 3. 核心工具函数 ==========================
+// 喂狗函数
+void feedWatchdog() {
+  esp_task_wdt_reset();
+}
+
+// WiFi检查和重连
+void checkAndReconnectWiFi() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("⚠️ WiFi断线，正在重连...");
+    
+    // 清除屏幕顶部显示错误信息
+    tft.fillRect(10, 10, 220, 20, ST77XX_BLACK);
+    u8g2.begin(tft);
+    u8g2.setFont(u8g2_font_wqy12_t_gb2312);
+    u8g2.setForegroundColor(ST77XX_RED);
+    u8g2.setBackgroundColor(ST77XX_BLACK);
+    u8g2.drawUTF8(15, 25, "WiFi断线重连中...");
+    
+    WiFi.disconnect();
+    delay(1000);
+    WiFi.begin(ssid, password);
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+      delay(500);
+      Serial.print(".");
+      feedWatchdog();  // 重连过程中喂狗
+      attempts++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\n✅ WiFi重连成功! IP: " + WiFi.localIP().toString());
+      tft.fillRect(10, 10, 220, 20, ST77XX_BLACK);  // 清除错误信息
+      timeClient.forceUpdate();  // 强制同步时间
+    } else {
+      Serial.println("\n❌ WiFi重连失败，将在30秒后重试");
+    }
+  }
+}
+
 String formatNumber(int num) {
   return num < 10 ? "0" + String(num) : String(num);
 }
@@ -97,39 +145,6 @@ void drawGradientBackground() {
   tft.fillScreen(ST77XX_BLACK);
 }
 
-// 绘制时钟图标
-void drawClockIcon(int x, int y, uint16_t color) {
-  tft.drawCircle(x, y, 10, color);
-  tft.drawCircle(x, y, 8, color);
-  // 时针
-  tft.drawLine(x, y, x, y - 5, color);
-  // 分针
-  tft.drawLine(x, y, x + 4, y, color);
-}
-
-// 绘制温湿度图标
-void drawIcon(int x, int y, const char* type, uint16_t color) {
-  if (strcmp(type, "temp") == 0) {
-    // 温度计图标
-    tft.drawCircle(x, y, 8, color);
-    tft.drawCircle(x, y, 5, color);
-    tft.fillRect(x - 2, y + 8, 4, 8, color);
-    // 刻度
-    tft.drawPixel(x - 5, y, color);
-    tft.drawPixel(x + 5, y, color);
-    tft.drawPixel(x, y - 8, color);
-    tft.drawPixel(x, y + 12, color);
-  } else if (strcmp(type, "humi") == 0) {
-    // 水滴图标
-    tft.drawCircle(x, y - 3, 8, color);
-    tft.drawCircle(x, y - 3, 6, color);
-    // 底部尖端
-    tft.drawLine(x, y - 3, x - 5, y + 10, color);
-    tft.drawLine(x, y - 3, x + 5, y + 10, color);
-    tft.drawLine(x - 5, y + 10, x + 5, y + 10, color);
-  }
-}
-
 // ========================== 4. 界面绘制（美化版） ==========================
 void drawBeautifulBorder() {
   // 外边框（圆角）
@@ -151,10 +166,28 @@ void initTempHumiUI() {
 
 // ========================== 5. 时钟更新（消除闪烁版） ==========================
 void updateClock() {
-  timeClient.update();
+  // 尝试更新时间，每分钟只尝试一次，避免频繁失败日志
+  static unsigned long lastNTPAttempt = 0;
+  unsigned long currentMillis = millis();
+  
+  if (currentMillis - lastNTPAttempt >= 60000) {  // 每分钟尝试一次
+    lastNTPAttempt = currentMillis;
+    if (!timeClient.update()) {
+      static int failCount = 0;
+      failCount++;
+      if (failCount % 5 == 0) {  // 每5次失败才打印一次
+        Serial.printf("⚠️ NTP同步失败 (已失败%d次)，使用缓存时间\n", failCount);
+      }
+    } else {
+      Serial.println("✅ NTP同步成功");
+    }
+  }
+  
   unsigned long epochTime = timeClient.getEpochTime();
   struct tm *ptm = gmtime((time_t *)&epochTime);
-  if (ptm == NULL) return;
+  if (ptm == NULL) {
+    return;
+  }
 
   int year = ptm->tm_year + 1900;
   int month = ptm->tm_mon + 1;
@@ -215,11 +248,14 @@ void updateClock() {
 
 // ========================== 6. 温湿度更新（美化版） ==========================
 void updateTempHumi() {
+  // 喂狗，防止传感器读取超时
+  feedWatchdog();
+  
   float humidity = dht.readHumidity();
   float temperature = dht.readTemperature();
 
   if (isnan(humidity) || isnan(temperature)) {
-    Serial.println("DHT11 read error!");
+    Serial.println("❌ DHT11读取错误!");
     tft.fillRect(15, 162, 210, 70, ST77XX_BLACK);
     u8g2.begin(tft);
     u8g2.setFont(u8g2_font_wqy16_t_gb2312);
@@ -282,20 +318,78 @@ void updateTempHumi() {
 // ========================== 7. 初始化/主循环 ==========================
 void setup() {
   Serial.begin(115200);
+  delay(1000);
+  
+  // 检查重启原因
+  esp_reset_reason_t reset_reason = esp_reset_reason();
+  bootCount++;
+  Serial.println("\n========================================");
+  Serial.printf("🚀 系统启动 #%lu\n", bootCount);
+  Serial.print("重启原因: ");
+  switch(reset_reason) {
+    case ESP_RST_POWERON:   Serial.println("上电复位"); break;
+    case ESP_RST_SW:        Serial.println("软件复位"); break;
+    case ESP_RST_PANIC:     Serial.println("异常崩溃"); break;
+    case ESP_RST_INT_WDT:   Serial.println("看门狗超时"); break;
+    case ESP_RST_TASK_WDT:  Serial.println("任务看门狗"); break;
+    case ESP_RST_WDT:       Serial.println("其他看门狗"); break;
+    case ESP_RST_DEEPSLEEP: Serial.println("深度睡眠唤醒"); break;
+    case ESP_RST_BROWNOUT:  Serial.println("欠压复位"); break;
+    default:                Serial.println("未知原因"); break;
+  }
+  Serial.println("========================================\n");
 
-  Serial.print("Connecting WiFi: ");
+  // 初始化看门狗 (8秒超时)
+  Serial.println("⏱️  启用看门狗 (超时时间: 8秒)");
+  esp_task_wdt_init(WDT_TIMEOUT, true);  // 启用panic重启
+  esp_task_wdt_add(NULL);                // 添加当前任务到看门狗
+  feedWatchdog();
+
+  Serial.print("📡 连接WiFi: ");
   Serial.println(ssid);
   WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
+  int wifi_attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && wifi_attempts < 20) {
     delay(500);
     Serial.print(".");
+    feedWatchdog();  // WiFi连接过程中喂狗
+    wifi_attempts++;
   }
-  Serial.println("\nWiFi Connected! IP: " + WiFi.localIP().toString());
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ WiFi连接成功! IP: " + WiFi.localIP().toString());
+    Serial.println("📶 信号强度: " + String(WiFi.RSSI()) + " dBm");
+  } else {
+    Serial.println("\n⚠️ WiFi连接失败，将继续尝试...");
+  }
+  feedWatchdog();
 
   dht.begin();
+  Serial.println("🌡️  DHT11传感器已初始化");
+  
   tft.init(240, 240);
   tft.setRotation(3);
+  Serial.println("📺 ST7789屏幕已初始化");
+  feedWatchdog();
+  
   timeClient.begin();
+  Serial.println("🕒 NTP客户端已启动");
+  
+  // 尝试首次NTP同步
+  Serial.print("⏰ 正在同步网络时间...");
+  for (int i = 0; i < 3; i++) {
+    feedWatchdog();
+    if (timeClient.forceUpdate()) {
+      Serial.println(" ✅ 成功!");
+      Serial.println("当前时间: " + timeClient.getFormattedTime());
+      break;
+    }
+    Serial.print(".");
+    delay(1000);
+  }
+  if (!timeClient.isTimeSet()) {
+    Serial.println("\n⚠️ NTP同步失败，将使用默认时间并稍后重试");
+  }
 
   drawBeautifulBorder();
   u8g2.begin(tft);
@@ -306,22 +400,52 @@ void setup() {
   int msg_x, msg_y;
   getCenterPos(u8g2, msg.c_str(), 0, 100, 240, 40, msg_x, msg_y);
   u8g2.drawUTF8(msg_x, msg_y, msg.c_str());
-  delay(2000);
+  
+  // 等待时间同步
+  for (int i = 0; i < 4; i++) {
+    delay(500);
+    feedWatchdog();
+  }
 
   initTempHumiUI();
   updateClock();
+  
+  Serial.println("✅ 系统初始化完成！");
+  Serial.println("========================================\n");
 }
 
 void loop() {
+  // 首要任务：喂狗
+  feedWatchdog();
+  
   unsigned long currentTime = millis();
+  systemUptime = currentTime / 1000;  // 运行时间(秒)
 
+  // 定期检查WiFi连接状态
+  if (currentTime - lastWiFiCheckTime >= wifiCheckInterval) {
+    lastWiFiCheckTime = currentTime;
+    checkAndReconnectWiFi();
+    
+    // 每小时输出一次运行状态
+    if (systemUptime % 3600 == 0) {
+      Serial.printf("📊 系统运行时间: %lu小时 %lu分钟\n", 
+                    systemUptime / 3600, (systemUptime % 3600) / 60);
+      Serial.printf("   空闲内存: %d bytes\n", ESP.getFreeHeap());
+    }
+  }
+
+  // 更新时钟显示
   if (currentTime - lastClockRefreshTime >= clockRefreshInterval) {
     lastClockRefreshTime = currentTime;
     updateClock();
   }
 
+  // 更新温湿度显示
   if (currentTime - lastTempRefreshTime >= tempRefreshInterval) {
     lastTempRefreshTime = currentTime;
     updateTempHumi();
   }
+  
+  // 短暂延时，避免CPU满载
+  delay(10);
 }
