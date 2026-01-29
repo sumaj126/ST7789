@@ -14,10 +14,16 @@
 #include <DHT.h>
 #include <U8g2_for_Adafruit_GFX.h>
 #include "esp_task_wdt.h"  // 看门狗
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 
 // ========================== 1. 基础配置 ==========================
 const char* ssid = "jiajia";
 const char* password = "9812061104";
+
+// 办公室数据上传配置
+const char* serverUrl = "http://175.178.158.54:7789/update";
+const unsigned long uploadInterval = 5000;  // 上传间隔5秒
 
 #define DHTPIN 14
 #define DHTTYPE DHT22
@@ -60,6 +66,7 @@ const unsigned long tempRefreshInterval = 5000;
 const unsigned long clockRefreshInterval = 1000;
 unsigned long lastTempRefreshTime = 0;
 unsigned long lastClockRefreshTime = 0;
+unsigned long lastUploadTime = 0;
 unsigned long lastSeconds = 255;  // 用于检测秒数变化
 unsigned long lastWiFiCheckTime = 0;
 const unsigned long wifiCheckInterval = 30000;  // WiFi检查间隔30秒
@@ -78,6 +85,7 @@ void drawRoundedRect(int x, int y, int w, int h, int r, uint16_t color);
 void drawGradientBackground();
 void checkAndReconnectWiFi();
 void feedWatchdog();
+void uploadData(float temperature, float humidity);
 
 // ========================== 3. 核心工具函数 ==========================
 // 喂狗函数
@@ -143,6 +151,43 @@ void drawRoundedRect(int x, int y, int w, int h, int r, uint16_t color) {
 // 绘制渐变背景（纯黑背景）
 void drawGradientBackground() {
   tft.fillScreen(ST77XX_BLACK);
+}
+
+// ========================== 数据上传 ==========================
+void uploadData(float temperature, float humidity) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ WiFi未连接，跳过上传");
+    return;
+  }
+
+  HTTPClient http;
+  http.setTimeout(10000);  // 10秒超时
+
+  // 构建JSON数据
+  StaticJsonDocument<128> doc;
+  doc["temperature"] = round(temperature * 10) / 10.0;  // 保留1位小数
+  doc["humidity"] = round(humidity * 10) / 10.0;  // 保留1位小数
+
+  String jsonData;
+  serializeJson(doc, jsonData);
+
+  Serial.println("📤 正在上传数据...");
+  Serial.println("数据: " + jsonData);
+
+  // 发送HTTP POST请求
+  http.begin(serverUrl);
+  http.addHeader("Content-Type", "application/json");
+
+  int httpResponseCode = http.POST(jsonData);
+
+  if (httpResponseCode > 0) {
+    String response = http.getString();
+    Serial.printf("✅ 上传成功! 状态码: %d, 响应: %s\n", httpResponseCode, response.c_str());
+  } else {
+    Serial.printf("❌ 上传失败! 错误码: %d, %s\n", httpResponseCode, http.errorToString(httpResponseCode).c_str());
+  }
+
+  http.end();
 }
 
 // ========================== 4. 界面绘制（美化版） ==========================
@@ -250,7 +295,7 @@ void updateClock() {
 void updateTempHumi() {
   // 喂狗，防止传感器读取超时
   feedWatchdog();
-  
+
   float humidity = dht.readHumidity();
   float temperature = dht.readTemperature();
 
@@ -444,8 +489,15 @@ void loop() {
   if (currentTime - lastTempRefreshTime >= tempRefreshInterval) {
     lastTempRefreshTime = currentTime;
     updateTempHumi();
+
+    // 定时上传数据到服务器
+    if (currentTime - lastUploadTime >= uploadInterval) {
+      lastUploadTime = currentTime;
+      feedWatchdog();
+      uploadData(dht.readTemperature(), dht.readHumidity());
+    }
   }
-  
+
   // 短暂延时，避免CPU满载
   delay(10);
 }
