@@ -64,8 +64,10 @@ NTPClient timeClient(ntpUDP, "pool.ntp.org", 28800, 60000);  // 使用更稳定�
 // 全局变量
 const unsigned long tempRefreshInterval = 5000;
 const unsigned long clockRefreshInterval = 1000;
+const unsigned long ntpSyncInterval = 86400000;  // NTP同步间隔：24小时（一天一次）
 unsigned long lastTempRefreshTime = 0;
 unsigned long lastClockRefreshTime = 0;
+unsigned long lastNTPSyncTime = 0;
 unsigned long lastUploadTime = 0;
 unsigned long lastSeconds = 255;  // 用于检测秒数变化
 unsigned long lastWiFiCheckTime = 0;
@@ -211,12 +213,11 @@ void initTempHumiUI() {
 
 // ========================== 5. 时钟更新（消除闪烁版） ==========================
 void updateClock() {
-  // 尝试更新时间，每分钟只尝试一次，避免频繁失败日志
-  static unsigned long lastNTPAttempt = 0;
   unsigned long currentMillis = millis();
-  
-  if (currentMillis - lastNTPAttempt >= 60000) {  // 每分钟尝试一次
-    lastNTPAttempt = currentMillis;
+
+  // 尝试更新时间，每天同步一次
+  if (lastNTPSyncTime == 0 || currentMillis - lastNTPSyncTime >= ntpSyncInterval) {
+    lastNTPSyncTime = currentMillis;
     if (!timeClient.update()) {
       static int failCount = 0;
       failCount++;
@@ -301,14 +302,15 @@ void updateTempHumi() {
 
   if (isnan(humidity) || isnan(temperature)) {
     Serial.println("❌ DHT22读取错误!");
-    tft.fillRect(15, 162, 210, 70, ST77XX_BLACK);
+    // 清除整个温湿度区域（包括竖线位置）
+    tft.fillRect(10, 162, 220, 70, ST77XX_BLACK);
     u8g2.begin(tft);
     u8g2.setFont(u8g2_font_wqy16_t_gb2312);
     u8g2.setForegroundColor(ST77XX_RED);
     u8g2.setBackgroundColor(ST77XX_BLACK);
     String errorStr = "传感器错误";
     int error_x, error_y;
-    getCenterPos(u8g2, errorStr.c_str(), 15, 162, 210, 70, error_x, error_y);
+    getCenterPos(u8g2, errorStr.c_str(), 10, 162, 220, 70, error_x, error_y);
     u8g2.drawUTF8(error_x, error_y, errorStr.c_str());
     return;
   }
@@ -322,9 +324,8 @@ void updateTempHumi() {
   if (humidity < 30) humiColor = ST77XX_ORANGE;
   else if (humidity > 80) humiColor = ST77XX_CYAN;
 
-  // 清除区域
-  tft.fillRect(15, 162, 100, 70, ST77XX_BLACK);
-  tft.fillRect(135, 162, 90, 70, ST77XX_BLACK);
+  // 清除区域（包括竖线位置）
+  tft.fillRect(10, 162, 220, 70, ST77XX_BLACK);
 
   u8g2.begin(tft);
   u8g2.setBackgroundColor(ST77XX_BLACK);
@@ -430,6 +431,7 @@ void setup() {
     if (timeClient.forceUpdate()) {
       Serial.println(" ✅ 成功!");
       Serial.println("当前时间: " + timeClient.getFormattedTime());
+      lastNTPSyncTime = millis();  // 标记同步成功
       break;
     }
     Serial.print(".");
@@ -437,6 +439,8 @@ void setup() {
   }
   if (!timeClient.isTimeSet()) {
     Serial.println("\n⚠️ NTP同步失败，将使用默认时间并稍后重试");
+    // 即使失败也设置同步时间，避免从0开始计时
+    lastNTPSyncTime = millis();
   }
 
   drawBeautifulBorder();
