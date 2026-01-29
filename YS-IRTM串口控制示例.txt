@@ -1,0 +1,243 @@
+// 添加在 main.cpp 的 loop() 函数中，在红外学习检查之后添加：
+
+// 串口命令处理（YS-IRTM适配版）
+if (Serial.available()) {
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+  cmd.toUpperCase();  // 转换为大写，方便输入
+
+  Serial.println("📨 收到命令: " + cmd);
+
+  // 红外学习模式
+  if (cmd == "LEARN" || cmd == "LEARN_MODE") {
+    if (codeCount >= 16) {
+      Serial.println("⚠️ 已学习满16个按键，请先清除学习数据");
+      return;
+    }
+
+    irLearnMode = true;
+    lastIrLearnTime = millis();
+    displayIRLearnMode();
+    Serial.println("🎓 进入红外学习模式");
+    Serial.println("   对准YS-IRTM模块按下遥控器按键");
+    Serial.println("   按键学习顺序：");
+    Serial.println("   1. 电源  2. 温度+  3. 温度-  4. 模式");
+    Serial.println("   5. 风速  6. 摆风   7. 强力   8. 睡眠");
+    Serial.println("   30秒无操作自动退出");
+  }
+
+  // 清除学习数据
+  else if (cmd == "CLEAR_LEARN" || cmd == "CLEAR") {
+    codeCount = 0;
+    for (int i = 0; i < 16; i++) {
+      learnedCodes[i] = "";
+      codeNames[i] = "";
+    }
+    Serial.println("✅ 学习数据已清除");
+    displayACStatus();
+  }
+
+  // 发送学习的红外代码
+  else if (cmd.startsWith("SEND_")) {
+    int index = cmd.substring(5).toInt() - 1;  // SEND_1 -> index 0
+    if (index >= 0 && index < codeCount) {
+      sendHaierACCommand(index);
+    } else {
+      Serial.println("❌ 无效的代码索引 (1-" + String(codeCount) + ")");
+    }
+  }
+
+  // 电源控制（发送索引1：电源）
+  else if (cmd == "AC_POWER_ON" || cmd == "AC_ON" || cmd == "ON") {
+    if (codeCount >= 1) {
+      sendHaierACCommand(0);  // 索引0是电源键
+      Serial.println("✅ 空调电源开关");
+    } else {
+      Serial.println("❌ 请先学习电源键");
+    }
+  }
+
+  // 温度控制（发送索引2和3）
+  else if (cmd.startsWith("AC_TEMP_") || cmd.startsWith("TEMP_")) {
+    String tempStr = cmd.substring(cmd.lastIndexOf('_') + 1);
+    int temp = tempStr.toInt();
+
+    if (temp < 16 || temp > 30) {
+      Serial.println("❌ 温度范围错误 (16-30°C)");
+      return;
+    }
+
+    // 先打开空调
+    if (codeCount >= 1) {
+      sendHaierACCommand(0);
+      delay(500);
+    }
+
+    // 根据当前温度调整（简单实现：假设当前26度）
+    // 实际应用中需要维护当前温度状态
+    int currentTemp = 26;
+    int diff = temp - currentTemp;
+
+    // 发送温度+或温度-
+    for (int i = 0; i < abs(diff); i++) {
+      if (diff > 0 && codeCount >= 3) {
+        sendHaierACCommand(2);  // 温度+
+      } else if (diff < 0 && codeCount >= 3) {
+        sendHaierACCommand(3);  // 温度-
+      }
+      delay(300);
+    }
+
+    Serial.printf("✅ 温度设置为 %d°C\n", temp);
+  }
+
+  // 模式控制（发送索引4）
+  else if (cmd == "AC_MODE_COOL") {
+    if (codeCount >= 4) {
+      // 先按几次模式键切换到制冷（需要根据实际测试调整次数）
+      for (int i = 0; i < 3; i++) {  // 假设需要按3次
+        sendHaierACCommand(3);
+        delay(500);
+      }
+      Serial.println("✅ 模式: 制冷");
+    } else {
+      Serial.println("❌ 请先学习模式键");
+    }
+  }
+  else if (cmd == "AC_MODE_HEAT") {
+    if (codeCount >= 4) {
+      for (int i = 0; i < 2; i++) {
+        sendHaierACCommand(3);
+        delay(500);
+      }
+      Serial.println("✅ 模式: 制热");
+    }
+  }
+
+  // 风速控制（发送索引5）
+  else if (cmd == "AC_FAN_HIGH") {
+    if (codeCount >= 5) {
+      sendHaierACCommand(4);
+      Serial.println("✅ 风速: 高");
+    }
+  }
+  else if (cmd == "AC_FAN_LOW") {
+    if (codeCount >= 5) {
+      sendHaierACCommand(4);
+      delay(500);
+      sendHaierACCommand(4);
+      Serial.println("✅ 风速: 低");
+    }
+  }
+
+  // 其他功能
+  else if (cmd == "AC_SWING_ON") {
+    if (codeCount >= 6) {
+      sendHaierACCommand(5);
+      Serial.println("✅ 摆风: 开启");
+    }
+  }
+  else if (cmd == "AC_TURBO_ON") {
+    if (codeCount >= 7) {
+      sendHaierACCommand(6);
+      Serial.println("✅ 强力: 开启");
+    }
+  }
+  else if (cmd == "AC_SLEEP_ON") {
+    if (codeCount >= 8) {
+      sendHaierACCommand(7);
+      Serial.println("✅ 睡眠: 开启");
+    }
+  }
+
+  // 状态查询
+  else if (cmd == "AC_STATUS" || cmd == "STATUS") {
+    Serial.println("\n========== 空调状态 ==========");
+    Serial.printf("已学习按键数: %d/16\n", codeCount);
+    Serial.println("\n学习按键列表:");
+    for (int i = 0; i < codeCount; i++) {
+      Serial.printf("  %d. %s - %s\n", i+1, codeNames[i].c_str(), learnedCodes[i].c_str());
+    }
+    Serial.println("==============================\n");
+  }
+
+  // YS-IRTM模块测试
+  else if (cmd == "TEST_IR") {
+    Serial.println("🧪 测试YS-IRTM模块...");
+
+    // 查询模块版本
+    sendYSIRTMCommand("AT+VERSION");
+    delay(100);
+    String response;
+    if (receiveYSIRTMData(response, 1000)) {
+      Serial.println("模块版本: " + response);
+    }
+
+    // 查询模块模式
+    sendYSIRTMCommand("AT+SENDMODE?");
+    delay(100);
+    if (receiveYSIRTMData(response, 1000)) {
+      Serial.println("发送模式: " + response);
+    }
+  }
+
+  // 发送自定义红外代码
+  else if (cmd.startsWith("SEND_CODE:")) {
+    String code = cmd.substring(10);
+    if (code.length() == 16) {  // YS-IRTM代码是16位十六进制
+      sendIRCode(code);
+    } else {
+      Serial.println("❌ 代码格式错误，应为16位十六进制");
+    }
+  }
+
+  // 帮助
+  else if (cmd == "HELP" || cmd == "?") {
+    Serial.println("\n========== 可用命令 ==========");
+    Serial.println("学习相关:");
+    Serial.println("  LEARN / LEARN_MODE  - 进入红外学习模式");
+    Serial.println("  CLEAR_LEARN / CLEAR - 清除学习数据");
+    Serial.println("  SEND_1 ~ SEND_16    - 发送学习按键1-16");
+    Serial.println("  STATUS              - 查看学习状态");
+    Serial.println("空调控制:");
+    Serial.println("  AC_ON / ON          - 电源开关");
+    Serial.println("  TEMP_26             - 设置温度26°C (16-30)");
+    Serial.println("  AC_MODE_COOL        - 制冷模式");
+    Serial.println("  AC_MODE_HEAT        - 制热模式");
+    Serial.println("  AC_FAN_HIGH         - 高风速");
+    Serial.println("  AC_FAN_LOW          - 低风速");
+    Serial.println("  AC_SWING_ON         - 开启摆风");
+    Serial.println("  AC_TURBO_ON         - 开启强力");
+    Serial.println("  AC_SLEEP_ON         - 开启睡眠");
+    Serial.println("模块测试:");
+    Serial.println("  TEST_IR             - 测试YS-IRTM模块");
+    Serial.println("  SEND_CODE:XXXXXXXX  - 发送自定义红外代码");
+    Serial.println("  HELP / ?            - 显示帮助");
+    Serial.println("==============================\n");
+  }
+
+  else if (cmd != "") {
+    Serial.println("❌ 未知命令，输入 HELP 查看可用命令");
+  }
+}
+
+// 添加启动信息打印函数
+void printStartupInfo() {
+  Serial.println("\n========================================");
+  Serial.println("🏠 ESP32 + YS-IRTM 空调控制系统");
+  Serial.println("========================================");
+  Serial.println("📡 YS-IRTM红外模块:");
+  Serial.println("   UART: GPIO16(RX) / GPIO17(TX)");
+  Serial.println("   波特率: 115200");
+  Serial.println("   协议: NEC编码");
+  Serial.println("🎓 红外学习:");
+  Serial.println("   1. 串口输入 LEARN 进入学习模式");
+  Serial.println("   2. 对准模块按下遥控器按键");
+  Serial.println("   3. 30秒超时自动退出");
+  Serial.println("💡 空调控制:");
+  Serial.println("   串口输入 HELP 查看所有命令");
+  Serial.println("========================================\n");
+}
+
+// 在 setup() 函数最后调用:
+// printStartupInfo();

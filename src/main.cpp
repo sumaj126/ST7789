@@ -1,7 +1,7 @@
 // ============================================================================
 // ESP32 温湿度显示系统 - 美化版
 // 功能：显示日期、星期、时间、温度和湿度
-// 硬件：ESP32 + ST7789 TFT屏幕 (240x240) + DHT11温湿度传感器
+// 硬件：ESP32 + ST7789 TFT屏幕 (240x240) + DHT22温湿度传感器
 // ============================================================================
 
 #include <Arduino.h>
@@ -9,7 +9,6 @@
 #include <WiFi.h>
 #include <NTPClient.h>
 #include <WiFiUdp.h>
-#include <HTTPClient.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <DHT.h>
@@ -20,13 +19,8 @@
 const char* ssid = "jiajia";
 const char* password = "9812061104";
 
-// 云服务器配置
-const char* serverUrl = "http://175.178.158.54:7789/update";
-const unsigned long uploadInterval = 10000;  // 每10秒上传一次
-unsigned long lastUploadTime = 0;
-
 #define DHTPIN 14
-#define DHTTYPE DHT11
+#define DHTTYPE DHT22
 DHT dht(DHTPIN, DHTTYPE);
 
 #define TFT_CS    5
@@ -84,43 +78,11 @@ void drawRoundedRect(int x, int y, int w, int h, int r, uint16_t color);
 void drawGradientBackground();
 void checkAndReconnectWiFi();
 void feedWatchdog();
-void uploadDataToServer(float temperature, float humidity);
 
 // ========================== 3. 核心工具函数 ==========================
 // 喂狗函数
 void feedWatchdog() {
   esp_task_wdt_reset();
-}
-
-// 上传数据到云服务器
-void uploadDataToServer(float temperature, float humidity) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("⚠️ WiFi未连接，跳过数据上传");
-    return;
-  }
-
-  HTTPClient http;
-  http.begin(serverUrl);
-  http.addHeader("Content-Type", "application/json");
-  
-  // 构建JSON数据
-  String jsonData = "{\"temperature\":" + String(temperature, 1) + 
-                    ",\"humidity\":" + String(humidity, 1) + "}";
-  
-  Serial.print("📤 上传数据到云服务器: ");
-  Serial.println(jsonData);
-  
-  int httpResponseCode = http.POST(jsonData);
-  
-  if (httpResponseCode > 0) {
-    Serial.print("✅ 上传成功! 响应码: ");
-    Serial.println(httpResponseCode);
-  } else {
-    Serial.print("❌ 上传失败! 错误: ");
-    Serial.println(http.errorToString(httpResponseCode));
-  }
-  
-  http.end();
 }
 
 // WiFi检查和重连
@@ -293,7 +255,7 @@ void updateTempHumi() {
   float temperature = dht.readTemperature();
 
   if (isnan(humidity) || isnan(temperature)) {
-    Serial.println("❌ DHT11读取错误!");
+    Serial.println("❌ DHT22读取错误!");
     tft.fillRect(15, 162, 210, 70, ST77XX_BLACK);
     u8g2.begin(tft);
     u8g2.setFont(u8g2_font_wqy16_t_gb2312);
@@ -304,13 +266,6 @@ void updateTempHumi() {
     getCenterPos(u8g2, errorStr.c_str(), 15, 162, 210, 70, error_x, error_y);
     u8g2.drawUTF8(error_x, error_y, errorStr.c_str());
     return;
-  }
-
-  // 定期上传数据到云服务器
-  unsigned long currentTime = millis();
-  if (currentTime - lastUploadTime >= uploadInterval) {
-    lastUploadTime = currentTime;
-    uploadDataToServer(temperature, humidity);
   }
 
   // 动态颜色
@@ -410,7 +365,7 @@ void setup() {
   feedWatchdog();
 
   dht.begin();
-  Serial.println("🌡️  DHT11传感器已初始化");
+  Serial.println("🌡️  DHT22传感器已初始化");
   
   tft.init(240, 240);
   tft.setRotation(3);

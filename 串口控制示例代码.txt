@@ -1,0 +1,198 @@
+// 添加在 main.cpp 的 loop() 函数中，在红外学习检查之后添加：
+
+// 串口命令处理（添加在 loop() 函数的 if (irrecv.decode(&results)) 之后）
+if (Serial.available()) {
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+  cmd.toUpperCase();  // 转换为大写，方便输入
+
+  Serial.println("📨 收到命令: " + cmd);
+
+  // 电源控制
+  if (cmd == "AC_POWER_ON" || cmd == "AC_ON" || cmd == "ON") {
+    acState.power = true;
+    sendHaierACCommand(acState);
+    Serial.println("✅ 空调已开启");
+  }
+  else if (cmd == "AC_POWER_OFF" || cmd == "AC_OFF" || cmd == "OFF") {
+    acState.power = false;
+    sendHaierACCommand(acState);
+    Serial.println("✅ 空调已关闭");
+  }
+
+  // 温度控制 (范围 16-30)
+  else if (cmd.startsWith("AC_TEMP_") || cmd.startsWith("TEMP_")) {
+    int temp = cmd.substring(cmd.lastIndexOf('_') + 1).toInt();
+    if (temp >= 16 && temp <= 30) {
+      acState.power = true;
+      acState.temp = temp;
+      sendHaierACCommand(acState);
+      Serial.printf("✅ 温度设置为 %d°C\n", temp);
+    } else {
+      Serial.println("❌ 温度范围错误 (16-30°C)");
+    }
+  }
+
+  // 模式控制
+  else if (cmd == "AC_MODE_AUTO") {
+    acState.power = true;
+    acState.mode = 0;
+    sendHaierACCommand(acState);
+    Serial.println("✅ 模式: 自动");
+  }
+  else if (cmd == "AC_MODE_COOL") {
+    acState.power = true;
+    acState.mode = 1;
+    sendHaierACCommand(acState);
+    Serial.println("✅ 模式: 制冷");
+  }
+  else if (cmd == "AC_MODE_HEAT") {
+    acState.power = true;
+    acState.mode = 2;
+    sendHaierACCommand(acState);
+    Serial.println("✅ 模式: 制热");
+  }
+  else if (cmd == "AC_MODE_DRY") {
+    acState.power = true;
+    acState.mode = 3;
+    sendHaierACCommand(acState);
+    Serial.println("✅ 模式: 除湿");
+  }
+  else if (cmd == "AC_MODE_FAN") {
+    acState.power = true;
+    acState.mode = 4;
+    sendHaierACCommand(acState);
+    Serial.println("✅ 模式: 送风");
+  }
+
+  // 风速控制
+  else if (cmd == "AC_FAN_AUTO") {
+    acState.fanSpeed = 0;
+    sendHaierACCommand(acState);
+    Serial.println("✅ 风速: 自动");
+  }
+  else if (cmd == "AC_FAN_LOW") {
+    acState.fanSpeed = 1;
+    sendHaierACCommand(acState);
+    Serial.println("✅ 风速: 低");
+  }
+  else if (cmd == "AC_FAN_MEDIUM" || cmd == "AC_FAN_MED") {
+    acState.fanSpeed = 2;
+    sendHaierACCommand(acState);
+    Serial.println("✅ 风速: 中");
+  }
+  else if (cmd == "AC_FAN_HIGH") {
+    acState.fanSpeed = 3;
+    sendHaierACCommand(acState);
+    Serial.println("✅ 风速: 高");
+  }
+
+  // 其他功能
+  else if (cmd == "AC_SWING_ON") {
+    acState.swing = true;
+    sendHaierACCommand(acState);
+    Serial.println("✅ 摆风: 开启");
+  }
+  else if (cmd == "AC_SWING_OFF") {
+    acState.swing = false;
+    sendHaierACCommand(acState);
+    Serial.println("✅ 摆风: 关闭");
+  }
+  else if (cmd == "AC_TURBO_ON") {
+    acState.turbo = true;
+    sendHaierACCommand(acState);
+    Serial.println("✅ 强力: 开启");
+  }
+  else if (cmd == "AC_TURBO_OFF") {
+    acState.turbo = false;
+    sendHaierACCommand(acState);
+    Serial.println("✅ 强力: 关闭");
+  }
+  else if (cmd == "AC_SLEEP_ON") {
+    acState.sleep = true;
+    sendHaierACCommand(acState);
+    Serial.println("✅ 睡眠: 开启");
+  }
+  else if (cmd == "AC_SLEEP_OFF") {
+    acState.sleep = false;
+    sendHaierACCommand(acState);
+    Serial.println("✅ 睡眠: 关闭");
+  }
+
+  // 状态查询
+  else if (cmd == "AC_STATUS" || cmd == "STATUS") {
+    Serial.println("\n========== 空调状态 ==========");
+    Serial.printf("电源: %s\n", acState.power ? "开启" : "关闭");
+    Serial.printf("温度: %d°C\n", acState.temp);
+    const char* modes[] = {"自动", "制冷", "制热", "除湿", "送风"};
+    Serial.printf("模式: %s\n", modes[acState.mode % 5]);
+    const char* fans[] = {"自动", "低", "中", "高"};
+    Serial.printf("风速: %s\n", fans[acState.fanSpeed % 4]);
+    Serial.printf("摆风: %s\n", acState.swing ? "开启" : "关闭");
+    Serial.printf("强力: %s\n", acState.turbo ? "开启" : "关闭");
+    Serial.printf("睡眠: %s\n", acState.sleep ? "开启" : "关闭");
+    Serial.printf("学习代码数: %d\n", codeCount);
+    Serial.println("==============================\n");
+  }
+
+  // 学习模式
+  else if (cmd == "LEARN" || cmd == "LEARN_MODE") {
+    irLearnMode = true;
+    lastIrLearnTime = millis();
+    codeCount = 0;  // 清空之前的代码
+    displayIRLearnMode();
+    Serial.println("🎓 进入红外学习模式");
+    Serial.println("   对准接收器按下遥控器按键");
+    Serial.println("   30秒超时自动退出");
+  }
+
+  // 帮助
+  else if (cmd == "HELP" || cmd == "?") {
+    Serial.println("\n========== 可用命令 ==========");
+    Serial.println("电源:");
+    Serial.println("  AC_ON / ON          - 开启空调");
+    Serial.println("  AC_OFF / OFF        - 关闭空调");
+    Serial.println("温度 (16-30°C):");
+    Serial.println("  AC_TEMP_26 / TEMP_26- 设置温度26°C");
+    Serial.println("模式:");
+    Serial.println("  AC_MODE_AUTO        - 自动模式");
+    Serial.println("  AC_MODE_COOL        - 制冷模式");
+    Serial.println("  AC_MODE_HEAT        - 制热模式");
+    Serial.println("  AC_MODE_DRY         - 除湿模式");
+    Serial.println("  AC_MODE_FAN         - 送风模式");
+    Serial.println("风速:");
+    Serial.println("  AC_FAN_AUTO         - 自动风速");
+    Serial.println("  AC_FAN_LOW          - 低风速");
+    Serial.println("  AC_FAN_MEDIUM       - 中风速");
+    Serial.println("  AC_FAN_HIGH         - 高风速");
+    Serial.println("其他:");
+    Serial.println("  AC_SWING_ON/OFF     - 摆风开关");
+    Serial.println("  AC_TURBO_ON/OFF     - 强力开关");
+    Serial.println("  AC_SLEEP_ON/OFF     - 睡眠开关");
+    Serial.println("  AC_STATUS / STATUS  - 查看状态");
+    Serial.println("  LEARN / LEARN_MODE  - 红外学习模式");
+    Serial.println("  HELP / ?            - 显示帮助");
+    Serial.println("==============================\n");
+  }
+
+  else if (cmd != "") {
+    Serial.println("❌ 未知命令，输入 HELP 查看可用命令");
+  }
+}
+
+// 添加一个函数在 setup() 的最后，显示启动信息：
+void printStartupInfo() {
+  Serial.println("\n========================================");
+  Serial.println("🏠 ESP32 红外空调控制系统");
+  Serial.println("========================================");
+  Serial.println("📡 红外学习:");
+  Serial.println("   1. 串口输入 LEARN 进入学习模式");
+  Serial.println("   2. 对准接收器按下遥控器按键");
+  Serial.println("   3. 30秒超时自动退出");
+  Serial.println("💡 空调控制:");
+  Serial.println("   串口输入 HELP 查看所有命令");
+  Serial.println("========================================\n");
+}
+
+// 在 setup() 函数最后调用：
+// printStartupInfo();

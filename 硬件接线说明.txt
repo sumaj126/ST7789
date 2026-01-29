@@ -1,0 +1,104 @@
+ESP32 + ST7789 + DHT22 + YS-IRTM 硬件接线说明
+======================================
+
+【ST7789 TFT屏幕 (240x240) 连接】
+  ST7789    ESP32    说明
+  ──────────────────────────────────
+  VCC   -> 3.3V     逻辑电路供电（必需）
+  GND   -> GND      公共地（必需）
+  SCL   -> GPIO18   SPI时钟
+  SDA   -> GPIO23   SPI数据
+  RES   -> GPIO15   复位（可选）
+  DC    -> GPIO2    数据/命令
+  CS    -> GPIO5    片选（可选，可接地）
+  BLK   -> 5V       背光电源（必需！）
+
+  ⚠️ 重要：VCC和BLK都必须接，不能省略！
+
+【DHT22 温湿度传感器连接】
+  DHT22 -> ESP32
+  VCC  -> 3.3V
+  GND  -> GND
+  DATA -> GPIO14
+
+  注意：DHT22比DHT11精度更高，测量范围更广
+       温度：-40°C ~ 80°C (精度±0.5°C)
+       湿度：0% ~ 100% (精度±2%)
+
+【YS-IRTM 红外模块连接】
+  YS-IRTM   ESP32    说明
+  ──────────────────────────────────
+  VCC   -> 3.3V     供电
+  GND   -> GND      公共地
+  RX    -> GPIO16   UART2 TX
+  TX    -> GPIO17   UART2 RX
+
+  波特率：115200
+  协议：NEC红外编解码
+
+【引脚总览】
+  电源类：
+  3.3V   - ST7789 VCC, DHT22, YS-IRTM
+  5V     - ST7789 BLK (背光)
+  GND    - ST7789, DHT22, YS-IRTM
+
+  数字IO：
+  GPIO2  - TFT DC
+  GPIO5  - TFT CS (可选，可接地)
+  GPIO14 - DHT22 DATA
+  GPIO15 - TFT RES (可选)
+  GPIO16 - YS-IRTM RX (UART2 TX)
+  GPIO17 - YS-IRTM TX (UART2 RX)
+
+  SPI接口：
+  GPIO18 - TFT SCL (SPI CLK)
+  GPIO23 - TFT SDA (SPI MOSI)
+
+  UART2接口：
+  GPIO16 - UART2 TX
+  GPIO17 - UART2 RX
+
+【接线提示】
+  1. 使用面包板+杜邦线方便调试
+  2. 所有模块GND必须共地
+  3. ST7789需要3.3V(VCC)和5V(BLK)双电压
+  4. DHT22建议在VCC和DATA之间加10K上拉电阻
+  5. YS-IRTM的RX接ESP32的TX2(GPIO16)
+  6. YS-IRTM的TX接ESP32的RX2(GPIO17)
+
+【电压说明】
+  - 3.3V供电：ESP32逻辑、ST7789芯片、DHT22、YS-IRTM
+  - 5V供电：ST7789背光(BLK引脚)
+  - 两路电源都需要，缺一不可！
+
+【红外控制命令】
+  通过串口监视器输入以下命令：
+  1. learn    - 进入红外学习模式，学习海尔空调遥控器
+  2. send XXX - 发送红外码(XXX为32位HEX，如: 00FFA25D)
+  3. on       - 开启空调
+  4. off      - 关闭空调
+  5. temp XX  - 设置空调温度(16-30度)
+  6. help     - 显示帮助信息
+
+【功能说明】
+  此系统功能：
+  ✓ 显示日期和星期
+  ✓ 显示时间（NTP网络同步）
+  ✓ 显示温度（DHT22）
+  ✓ 显示湿度（DHT22）
+  ✓ WiFi连接和断线重连
+  ✓ 数据上传到云服务器
+  ✓ 看门狗保护
+  ✓ 红外学习(YS-IRTM)
+  ✓ 红外发送(YS-IRTM)
+  ✓ 海尔空调控制
+
+【使用步骤】
+  1. 正确连接所有硬件
+  2. 上传代码到ESP32
+  3. 打开串口监视器(115200波特率)
+  4. 输入"help"查看命令
+  5. 输入"learn"进入学习模式
+  6. 对着YS-IRTM按下海尔空调遥控器的按键
+  7. 学习成功后显示红外码，记录下来
+  8. 使用"send XXX"发送红外码控制空调
