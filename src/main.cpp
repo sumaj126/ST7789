@@ -357,6 +357,9 @@ void updateTempHumi() {
   getCenterPos(u8g2, humiStr.c_str(), 135, 190, 100, 35, humi_val_x, humi_val_y);
   u8g2.drawUTF8(humi_val_x, humi_val_y, humiStr.c_str());
 
+  // 重新绘制中间分隔竖线
+  tft.drawFastVLine(120, 162, 70, ST77XX_GRAY_DARK);
+
   Serial.printf("Temp: %.1f C, Humi: %.1f %%\n", temperature, humidity);
 }
 
