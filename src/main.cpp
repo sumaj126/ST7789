@@ -16,6 +16,7 @@
 #include "esp_task_wdt.h"  // 看门狗
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <WebServer.h>  // HTTP服务器，用于接收空调控制指令
 
 // ========================== 1. 基础配置 ==========================
 const char* ssid = "jiajia";
@@ -29,11 +30,20 @@ const unsigned long uploadInterval = 5000;  // 上传间隔5秒
 #define DHTTYPE DHT22
 DHT dht(DHTPIN, DHTTYPE);
 
+// 红外模块配置（串口型）
+#define IR_SERIAL Serial2  // 使用串口2连接红外模块
+#define IR_RX_PIN 16      // 红外模块 RX 引脚（连接到 ESP32 的某个引脚，实际上是红外模块的 TX）
+#define IR_TX_PIN 17      // 红外模块 TX 引脚（连接到 ESP32 的某个引脚，实际上是红外模块的 RX）
+#define IR_BAUDRATE 115200
+
 #define TFT_CS    5
 #define TFT_RST   15
 #define TFT_DC    2
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 U8G2_FOR_ADAFRUIT_GFX u8g2;
+
+// HTTP服务器配置
+WebServer webServer(80);
 
 // 颜色定义（优化配色）
 #define ST77XX_BLACK     0x0000
@@ -56,7 +66,8 @@ U8G2_FOR_ADAFRUIT_GFX u8g2;
 
 // NTP配置
 WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "pool.ntp.org", 28800, 60000);  // 使用更稳定的NTP服务器
+// 更新间隔改为60秒，失败时能更快重试
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 28800, 60000);
 
 // 看门狗配置
 #define WDT_TIMEOUT 8  // 看门狗超时时间(秒)
@@ -65,15 +76,21 @@ NTPClient timeClient(ntpUDP, "pool.ntp.org", 28800, 60000);  // 使用更稳定�
 const unsigned long tempRefreshInterval = 5000;
 const unsigned long clockRefreshInterval = 1000;
 const unsigned long ntpSyncInterval = 86400000;  // NTP同步间隔：24小时（一天一次）
+const unsigned long acCheckInterval = 60000;  // 空调检查间隔：60秒（1分钟）
 unsigned long lastTempRefreshTime = 0;
 unsigned long lastClockRefreshTime = 0;
 unsigned long lastNTPSyncTime = 0;
 unsigned long lastUploadTime = 0;
+unsigned long lastACCheckTime = 0;
 unsigned long lastSeconds = 255;  // 用于检测秒数变化
 unsigned long lastWiFiCheckTime = 0;
 const unsigned long wifiCheckInterval = 30000;  // WiFi检查间隔30秒
 unsigned long bootCount = 0;
 unsigned long systemUptime = 0;
+
+// 空调控制状态
+bool acIsOn = false;  // 空调是否开启
+bool lastACCommandSent = false;  // 上次是否发送过空调命令
 
 // ========================== 2. 函数前置声明 ==========================
 void drawBeautifulBorder();
@@ -88,6 +105,12 @@ void drawGradientBackground();
 void checkAndReconnectWiFi();
 void feedWatchdog();
 void uploadData(float temperature, float humidity);
+void initIRModule();
+void sendIRCommand(const char* command);
+void handleACOn();
+void handleACOff();
+void handleNotFound();
+void checkACControl(int weekday, int hour, int minute, float temperature);
 
 // ========================== 3. 核心工具函数 ==========================
 // 喂狗函数
@@ -192,6 +215,96 @@ void uploadData(float temperature, float humidity) {
   http.end();
 }
 
+// ========================== 红外模块控制 ==========================
+// 初始化红外模块
+void initIRModule() {
+  Serial.println("📡 初始化红外模块...");
+  IR_SERIAL.begin(IR_BAUDRATE, SERIAL_8N1, IR_RX_PIN, IR_TX_PIN);
+  delay(1000);
+  Serial.println("✅ 红外模块已初始化");
+  Serial.printf("   波特率: %d\n", IR_BAUDRATE);
+  Serial.printf("   引脚: RX=%d, TX=%d\n", IR_RX_PIN, IR_TX_PIN);
+}
+
+// 发送红外命令
+void sendIRCommand(const char* command) {
+  Serial.printf("📤 发送红外命令: %s\n", command);
+  IR_SERIAL.println(command);
+  delay(500);
+  
+  // 读取红外模块响应
+  if (IR_SERIAL.available()) {
+    String response = IR_SERIAL.readString();
+    Serial.printf("   模块响应: %s\n", response.c_str());
+  } else {
+    Serial.println("   无响应");
+  }
+}
+
+// HTTP 服务器处理函数：空调开机
+void handleACOn() {
+  Serial.println("🔴 收到空调开机请求");
+  sendIRCommand("fs00");
+  
+  String response = "{\"status\":\"success\",\"action\":\"ac_on\",\"message\":\"空调开机指令已发送\"}";
+  webServer.sendHeader("Access-Control-Allow-Origin", "*");
+  webServer.send(200, "application/json", response);
+  
+  Serial.println("✅ 空调开机响应已发送");
+}
+
+// HTTP 服务器处理函数：空调关机
+void handleACOff() {
+  Serial.println("🔴 收到空调关机请求");
+  sendIRCommand("fs20");
+  
+  String response = "{\"status\":\"success\",\"action\":\"ac_off\",\"message\":\"空调关机指令已发送\"}";
+  webServer.sendHeader("Access-Control-Allow-Origin", "*");
+  webServer.send(200, "application/json", response);
+  
+  Serial.println("✅ 空调关机响应已发送");
+}
+
+// HTTP 服务器处理函数：404
+void handleNotFound() {
+  String response = "{\"status\":\"error\",\"message\":\"API not found\"}";
+  webServer.sendHeader("Access-Control-Allow-Origin", "*");
+  webServer.send(404, "application/json", response);
+}
+
+// 空调自动控制逻辑
+void checkACControl(int weekday, int hour, int minute, float temperature) {
+  // weekday: 0=周日, 1=周一, ..., 6=周六
+  
+  // 判断是否在工作日（周一到周五）
+  bool isWorkday = (weekday >= 1 && weekday <= 5);
+  
+  if (!isWorkday) {
+    // 周末不做自动控制
+    return;
+  }
+
+  // 早上 8:00 检查：温度低于17度，打开空调
+  if (hour == 8 && minute == 0) {
+    if (temperature < 17.0) {
+      Serial.println("🕗 早上8点，温度低于17°C，准备开启空调...");
+      sendIRCommand("fs00");
+      acIsOn = true;
+      lastACCommandSent = true;
+    } else {
+      Serial.printf("🕗 早上8点，温度%.1f°C，不需要开启空调\n", temperature);
+    }
+  }
+  
+  // 下午 17:30：无论空调是否开启，都发送关机命令
+  if (hour == 17 && minute == 30) {
+    Serial.println("🕕 下午5:30，准备关闭空调...");
+    sendIRCommand("fs20");
+    acIsOn = false;
+    lastACCommandSent = true;
+  }
+}
+
 // ========================== 4. 界面绘制（美化版） ==========================
 void drawBeautifulBorder() {
   // 外边框（圆角）
@@ -245,6 +358,19 @@ void updateClock() {
 
   String weekdayStrs[] = {"周日", "周一", "周二", "周三", "周四", "周五", "周六"};
   String weekdayStr = weekdayStrs[weekday % 7];
+
+  // 检查空调控制（每分钟检查一次）
+  if (seconds == 0 && !lastACCommandSent) {
+    float temp = dht.readTemperature();
+    if (!isnan(temp)) {
+      checkACControl(weekday, hours, minutes, temp);
+    }
+  }
+  
+  // 重置命令标志（每分钟重置一次）
+  if (seconds == 0) {
+    lastACCommandSent = false;
+  }
 
   u8g2.begin(tft);
 
@@ -413,6 +539,9 @@ void setup() {
   }
   feedWatchdog();
 
+  // 初始化红外模块
+  initIRModule();
+
   dht.begin();
   Serial.println("🌡️  DHT22传感器已初始化");
   
@@ -439,8 +568,7 @@ void setup() {
   }
   if (!timeClient.isTimeSet()) {
     Serial.println("\n⚠️ NTP同步失败，将使用默认时间并稍后重试");
-    // 即使失败也设置同步时间，避免从0开始计时
-    lastNTPSyncTime = millis();
+    // 失败时不设置 lastNTPSyncTime，让其继续尝试同步
   }
 
   drawBeautifulBorder();
@@ -462,6 +590,17 @@ void setup() {
   initTempHumiUI();
   updateClock();
   
+  // 启动 HTTP 服务器（空调控制 API）
+  Serial.println("🌐 启动 HTTP 服务器...");
+  webServer.on("/ac/on", HTTP_GET, handleACOn);
+  webServer.on("/ac/off", HTTP_GET, handleACOff);
+  webServer.onNotFound(handleNotFound);
+  webServer.begin();
+  Serial.println("✅ HTTP 服务器已启动");
+  Serial.printf("   API 端点:\n");
+  Serial.printf("     - http://%s/ac/on  (空调开机)\n", WiFi.localIP().toString().c_str());
+  Serial.printf("     - http://%s/ac/off (空调关机)\n", WiFi.localIP().toString().c_str());
+  
   Serial.println("✅ 系统初始化完成！");
   Serial.println("========================================\n");
 }
@@ -469,6 +608,24 @@ void setup() {
 void loop() {
   // 首要任务：喂狗
   feedWatchdog();
+  
+  // 处理 HTTP 服务器请求
+  webServer.handleClient();
+  
+  // 处理串口命令（用于测试）
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    if (command.length() > 0) {
+      Serial.printf("🔤 收到串口命令: %s\n", command.c_str());
+      IR_SERIAL.println(command);
+      delay(500);
+      if (IR_SERIAL.available()) {
+        String response = IR_SERIAL.readString();
+        Serial.printf("📥 红外模块响应: %s\n", response.c_str());
+      }
+    }
+  }
   
   unsigned long currentTime = millis();
   systemUptime = currentTime / 1000;  // 运行时间(秒)
