@@ -7,8 +7,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <WiFi.h>
-#include <NTPClient.h>
-#include <WiFiUdp.h>
+#include <time.h>  // ESP32 内置时间函数
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <DHT.h>
@@ -17,6 +16,9 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <WebServer.h>  // HTTP服务器，用于接收空调控制指令
+#include <PubSubClient.h>  // MQTT客户端
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 // ========================== 1. 基础配置 ==========================
 const char* ssid = "jiajia";
@@ -45,13 +47,21 @@ U8G2_FOR_ADAFRUIT_GFX u8g2;
 // HTTP服务器配置
 WebServer webServer(80);
 
-// 颜色定义（优化配色）
+// MQTT配置
+const char* mqttServer = "175.178.158.54";
+const int mqttPort = 1883;
+const char* mqttTopic = "office/ac/control";
+WiFiClient mqttWifiClient;
+PubSubClient mqttClient(mqttWifiClient);
+
+// 颜色定义（部分由库提供）
 #define ST77XX_BLACK     0x0000
 #define ST77XX_WHITE     0xFFFF
 #define ST77XX_RED       0xF800
 #define ST77XX_GREEN     0x07E0
 #define ST77XX_BLUE      0x001F
 #define ST77XX_YELLOW    0xFFE0
+// ST77XX_ORANGE 已在库中定义
 #define ST77XX_CYAN      0x07FF
 #define ST77XX_MAGENTA   0xF81F
 #define ST77XX_GRAY_LIGHT 0x5AEB
@@ -64,10 +74,10 @@ WebServer webServer(80);
 #define DATE_BG_COLOR    0x0010
 #define TIME_BG_COLOR    0x0015
 
-// NTP配置
-WiFiUDP ntpUDP;
-// 更新间隔改为60秒，失败时能更快重试
-NTPClient timeClient(ntpUDP, "pool.ntp.org", 28800, 60000);
+// NTP配置 - 使用 ESP32 内置 configTime
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 8 * 3600;  // GMT+8
+const int daylightOffset_sec = 0;
 
 // 看门狗配置
 #define WDT_TIMEOUT 8  // 看门狗超时时间(秒)
@@ -111,6 +121,8 @@ void handleACOn();
 void handleACOff();
 void handleNotFound();
 void checkACControl(int weekday, int hour, int minute, float temperature);
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+void mqttTask(void *pvParameters);
 
 // ========================== 3. 核心工具函数 ==========================
 // 喂狗函数
@@ -146,7 +158,7 @@ void checkAndReconnectWiFi() {
     if (WiFi.status() == WL_CONNECTED) {
       Serial.println("\n✅ WiFi重连成功! IP: " + WiFi.localIP().toString());
       tft.fillRect(10, 10, 220, 20, ST77XX_BLACK);  // 清除错误信息
-      timeClient.forceUpdate();  // 强制同步时间
+      // 不需要重新配置时间，ESP32会自动维护时间
     } else {
       Serial.println("\n❌ WiFi重连失败，将在30秒后重试");
     }
@@ -213,6 +225,97 @@ void uploadData(float temperature, float humidity) {
   }
 
   http.end();
+}
+
+// ========================== MQTT控制 ==========================
+// MQTT回调函数：收到消息
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  Serial.printf("📨 收到MQTT消息: %s\n", topic);
+
+  // 解析JSON消息
+  StaticJsonDocument<64> doc;
+  DeserializationError error = deserializeJson(doc, payload, length);
+
+  if (error) {
+    Serial.printf("❌ JSON解析失败: %s\n", error.c_str());
+    return;
+  }
+
+  const char* action = doc["action"];
+
+  if (strcmp(action, "on") == 0) {
+    Serial.println("❄️ MQTT指令：开启空调");
+    sendIRCommand("fs00");
+    acIsOn = true;
+  } else if (strcmp(action, "off") == 0) {
+    Serial.println("🔴 MQTT指令：关闭空调");
+    sendIRCommand("fs20");
+    acIsOn = false;
+  }
+}
+
+// MQTT 任务函数 - 在独立任务中运行，不阻塞主循环
+void mqttTask(void *pvParameters) {
+  Serial.println("📡 MQTT任务启动...");
+  mqttClient.setServer(mqttServer, mqttPort);
+  mqttClient.setCallback(mqttCallback);
+  mqttClient.setSocketTimeout(5000);  // 5秒超时
+
+  String clientId = "ESP32-Office-" + String(random(0xffff), HEX);
+  Serial.printf("   服务器: %s:%d\n", mqttServer, mqttPort);
+  Serial.printf("   客户端ID: %s\n", clientId.c_str());
+  Serial.printf("   主题: %s\n", mqttTopic);
+
+  bool lastWiFiStatus = false;
+
+  while (1) {
+    bool currentWiFiStatus = (WiFi.status() == WL_CONNECTED);
+
+    // 只在WiFi状态变化时打印日志
+    if (!currentWiFiStatus && lastWiFiStatus) {
+      Serial.println("⚠️ WiFi断开，MQTT任务等待...");
+    }
+
+    if (currentWiFiStatus) {
+      if (!mqttClient.connected()) {
+        Serial.print("🔄 连接MQTT...");
+
+        unsigned long connectStart = millis();
+        if (mqttClient.connect(clientId.c_str())) {
+          Serial.println(" ✅ 已连接");
+          mqttClient.subscribe(mqttTopic);
+          Serial.printf("   订阅主题: %s\n", mqttTopic);
+        } else {
+          int state = mqttClient.state();
+          Serial.print(" ❌ 失败 (状态: ");
+          Serial.print(state);
+          Serial.printf(") [耗时: %lums]\n", millis() - connectStart);
+
+          // PubSubClient 状态码说明
+          switch(state) {
+            case -4: Serial.println("   原因: MQTT_CONNECTION_TIMEOUT"); break;
+            case -3: Serial.println("   原因: MQTT_CONNECTION_LOST"); break;
+            case -2: Serial.println("   原因: MQTT_CONNECT_FAILED (服务器拒绝连接)"); break;
+            case -1: Serial.println("   原因: MQTT_DISCONNECTED"); break;
+            case 0: Serial.println("   原因: MQTT_CONNECTED"); break;
+            case 1: Serial.println("   原因: 连接协议错误"); break;
+            case 2: Serial.println("   原因: 客户端ID错误"); break;
+            case 3: Serial.println("   原因: 服务不可用"); break;
+            case 4: Serial.println("   原因: 用户名密码错误"); break;
+            case 5: Serial.println("   原因: 未授权"); break;
+            default: Serial.println("   原因: 未知错误"); break;
+          }
+        }
+      } else {
+        mqttClient.loop();  // 处理MQTT消息
+      }
+    }
+
+    lastWiFiStatus = currentWiFiStatus;
+
+    // 每5秒检查一次
+    vTaskDelay(pdMS_TO_TICKS(5000));
+  }
 }
 
 // ========================== 红外模块控制 ==========================
@@ -326,35 +429,24 @@ void initTempHumiUI() {
 
 // ========================== 5. 时钟更新（消除闪烁版） ==========================
 void updateClock() {
-  unsigned long currentMillis = millis();
-
-  // 尝试更新时间，每天同步一次
-  if (lastNTPSyncTime == 0 || currentMillis - lastNTPSyncTime >= ntpSyncInterval) {
-    lastNTPSyncTime = currentMillis;
-    if (!timeClient.update()) {
-      static int failCount = 0;
-      failCount++;
-      if (failCount % 5 == 0) {  // 每5次失败才打印一次
-        Serial.printf("⚠️ NTP同步失败 (已失败%d次)，使用缓存时间\n", failCount);
-      }
-    } else {
-      Serial.println("✅ NTP同步成功");
-    }
-  }
-  
-  unsigned long epochTime = timeClient.getEpochTime();
-  struct tm *ptm = gmtime((time_t *)&epochTime);
-  if (ptm == NULL) {
+  // 使用 time() 获取时间戳，然后用 localtime() 转换
+  time_t now = time(nullptr);
+  if (now < 1000000) {  // 时间未同步（epoch太小）
     return;
   }
 
-  int year = ptm->tm_year + 1900;
-  int month = ptm->tm_mon + 1;
-  int day = ptm->tm_mday;
-  int weekday = ptm->tm_wday;
-  int hours = ptm->tm_hour;
-  int minutes = ptm->tm_min;
-  int seconds = ptm->tm_sec;
+  struct tm *timeinfo = localtime(&now);
+  if (timeinfo == nullptr) {
+    return;
+  }
+
+  int year = timeinfo->tm_year + 1900;
+  int month = timeinfo->tm_mon + 1;
+  int day = timeinfo->tm_mday;
+  int weekday = timeinfo->tm_wday;
+  int hours = timeinfo->tm_hour;
+  int minutes = timeinfo->tm_min;
+  int seconds = timeinfo->tm_sec;
 
   String weekdayStrs[] = {"周日", "周一", "周二", "周三", "周四", "周五", "周六"};
   String weekdayStr = weekdayStrs[weekday % 7];
@@ -366,7 +458,7 @@ void updateClock() {
       checkACControl(weekday, hours, minutes, temp);
     }
   }
-  
+
   // 重置命令标志（每分钟重置一次）
   if (seconds == 0) {
     lastACCommandSent = false;
@@ -549,42 +641,29 @@ void setup() {
   tft.setRotation(3);
   Serial.println("📺 ST7789屏幕已初始化");
   feedWatchdog();
-  
-  timeClient.begin();
-  Serial.println("🕒 NTP客户端已启动");
-  
+
+  // 配置 NTP 时间
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  Serial.println("🕒 NTP时间同步已配置");
+
   // 尝试首次NTP同步
   Serial.print("⏰ 正在同步网络时间...");
-  for (int i = 0; i < 3; i++) {
+  struct tm timeinfo;
+  for (int i = 0; i < 10; i++) {  // 增加尝试次数
     feedWatchdog();
-    if (timeClient.forceUpdate()) {
+    if (getLocalTime(&timeinfo)) {
       Serial.println(" ✅ 成功!");
-      Serial.println("当前时间: " + timeClient.getFormattedTime());
+      Serial.printf("当前时间: %04d-%02d-%02d %02d:%02d:%02d\n",
+                   timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                   timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
       lastNTPSyncTime = millis();  // 标记同步成功
       break;
     }
     Serial.print(".");
-    delay(1000);
-  }
-  if (!timeClient.isTimeSet()) {
-    Serial.println("\n⚠️ NTP同步失败，将使用默认时间并稍后重试");
-    // 失败时不设置 lastNTPSyncTime，让其继续尝试同步
-  }
-
-  drawBeautifulBorder();
-  u8g2.begin(tft);
-  u8g2.setFont(u8g2_font_wqy16_t_gb2312);
-  u8g2.setForegroundColor(ST77XX_WHITE);
-  u8g2.setBackgroundColor(ST77XX_BLACK);
-  String msg = "正在同步时间...";
-  int msg_x, msg_y;
-  getCenterPos(u8g2, msg.c_str(), 0, 100, 240, 40, msg_x, msg_y);
-  u8g2.drawUTF8(msg_x, msg_y, msg.c_str());
-  
-  // 等待时间同步
-  for (int i = 0; i < 4; i++) {
     delay(500);
-    feedWatchdog();
+  }
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("\n⚠️ NTP同步失败，将使用默认时间并稍后重试");
   }
 
   initTempHumiUI();
@@ -603,12 +682,23 @@ void setup() {
   
   Serial.println("✅ 系统初始化完成！");
   Serial.println("========================================\n");
+
+  // 创建 MQTT 任务，在独立任务中运行
+  xTaskCreate(
+    mqttTask,           // 任务函数
+    "MQTTTask",         // 任务名称
+    4096,              // 堆栈大小
+    NULL,              // 参数
+    1,                 // 优先级
+    NULL               // 任务句柄
+  );
+  Serial.println("📡 MQTT任务已创建");
 }
 
 void loop() {
   // 首要任务：喂狗
   feedWatchdog();
-  
+
   // 处理 HTTP 服务器请求
   webServer.handleClient();
   
@@ -641,6 +731,15 @@ void loop() {
                     systemUptime / 3600, (systemUptime % 3600) / 60);
       Serial.printf("   空闲内存: %d bytes\n", ESP.getFreeHeap());
     }
+  }
+
+  // NTP时间同步（每天同步一次）
+  // 注意：ESP32在首次configTime后会自动维护系统时间
+  // 定期重新调用configTime可以校正时间漂移
+  if (currentTime - lastNTPSyncTime >= ntpSyncInterval) {
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    lastNTPSyncTime = currentTime;
+    Serial.println("🕒 NTP时间已重新同步");
   }
 
   // 更新时钟显示
