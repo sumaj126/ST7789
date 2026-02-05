@@ -464,14 +464,13 @@ void updateClock() {
     lastACCommandSent = false;
   }
 
-  u8g2.begin(tft);
-
   // 日期和星期显示（分两行显示）
   static String lastDateNum = "";
   static String lastWeekday = "";
   String dateNum = String(year) + "-" + formatNumber(month) + "-" + formatNumber(day);
 
   if (dateNum != lastDateNum || weekdayStr != lastWeekday) {
+    u8g2.begin(tft);  // 只在日期变化时初始化
     tft.fillRect(10, 10, 220, 70, ST77XX_BLACK); // 清除日期区
     u8g2.setFont(u8g2_font_wqy16_t_gb2312b);   // 使用加粗16号中文字体
     u8g2.setForegroundColor(ST77XX_WHITE);
@@ -495,16 +494,36 @@ void updateClock() {
   if (seconds != lastSeconds) {
     // 格式化时间
     String timeStr = formatNumber(hours) + ":" + formatNumber(minutes) + ":" + formatNumber(seconds);
+    static String lastTimeStr = "";
+    static bool timeFontSet = false;  // 标记字体是否已设置
 
-    u8g2.setFont(u8g2_font_logisoso26_tn);
+    // 只有时间字符串变化时才重绘（避免同一秒内重复刷新）
+    if (timeStr != lastTimeStr) {
+      // 首次需要初始化u8g2和设置字体
+      if (!timeFontSet) {
+        u8g2.begin(tft);
+        u8g2.setFont(u8g2_font_logisoso26_tn);
+        timeFontSet = true;
+      }
 
-    // 清除并重绘整个时间区域（使用背景色）
-    tft.fillRect(10, 92, 220, 60, ST77XX_BLACK);
+      // 计算秒数的位置（大约在时间字符串的右侧）
+      // 时间格式 HH:MM:SS，秒数占最后2位
+      int timeStrWidth = u8g2.getUTF8Width(timeStr.c_str());
+      int totalWidth = 220;  // 时间区域总宽度
+      int timeX = 10 + (totalWidth - timeStrWidth) / 2;
+      int timeY = 92 + 30 + 12;  // 垂直居中（考虑字体基线）
 
-    u8g2.setForegroundColor(ST77XX_WHITE);
-    int time_x, time_y;
-    getCenterPos(u8g2, timeStr.c_str(), 10, 92, 220, 60, time_x, time_y);
-    u8g2.drawUTF8(time_x, time_y, timeStr.c_str());
+      // 清除秒数区域（大约清除右边30像素）
+      int clearX = timeX + timeStrWidth - 50;
+      int clearWidth = 50;
+      if (clearX < 10) clearX = 10;
+      tft.fillRect(clearX, 92, clearWidth, 60, ST77XX_BLACK);
+
+      u8g2.setForegroundColor(ST77XX_WHITE);
+      u8g2.drawUTF8(timeX, timeY, timeStr.c_str());
+
+      lastTimeStr = timeStr;
+    }
 
     lastSeconds = seconds;
   }
