@@ -26,7 +26,7 @@ const char* password = "9812061104";
 
 // 办公室数据上传配置
 const char* serverUrl = "http://175.178.158.54:7789/update";
-const unsigned long uploadInterval = 5000;  // 上传间隔5秒
+const unsigned long uploadInterval = 60000;  // 上传间隔60秒
 
 #define DHTPIN 14
 #define DHTTYPE DHT22
@@ -51,6 +51,8 @@ WebServer webServer(80);
 const char* mqttServer = "175.178.158.54";
 const int mqttPort = 1883;
 const char* mqttTopic = "office/ac/control";
+const char* mqttScheduleTopic = "office/ac/schedule/enabled";  // 定时空调开关状态主题
+const char* mqttStatusTopic = "office/ac/schedule/status";  // 定时空调当前状态主题（ESP32反馈）
 WiFiClient mqttWifiClient;
 PubSubClient mqttClient(mqttWifiClient);
 
@@ -101,6 +103,11 @@ unsigned long systemUptime = 0;
 // 空调控制状态
 bool acIsOn = false;  // 空调是否开启
 bool lastACCommandSent = false;  // 上次是否发送过空调命令
+bool scheduleEnabled = true;  // 定时空调开关状态（默认启用）
+
+// 温度缓存（用于空调控制，避免重复读取DHT22）
+float cachedTemperature = 0;
+bool temperatureCacheValid = false;
 
 // ========================== 2. 函数前置声明 ==========================
 void drawBeautifulBorder();
@@ -198,7 +205,7 @@ void uploadData(float temperature, float humidity) {
   }
 
   HTTPClient http;
-  http.setTimeout(10000);  // 10秒超时
+  http.setTimeout(5000);  // 5秒超时（减少阻塞时间）
 
   // 构建JSON数据
   StaticJsonDocument<128> doc;
@@ -232,7 +239,29 @@ void uploadData(float temperature, float humidity) {
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   Serial.printf("📨 收到MQTT消息: %s\n", topic);
 
-  // 解析JSON消息
+  // 处理定时空调开关状态
+  if (strcmp(topic, mqttScheduleTopic) == 0) {
+    StaticJsonDocument<64> doc;
+    DeserializationError error = deserializeJson(doc, payload, length);
+    if (error) {
+      Serial.println("❌ JSON解析失败");
+      return;
+    }
+    scheduleEnabled = doc["enabled"];
+    Serial.printf("📅 定时空调: %s\n", scheduleEnabled ? "启用" : "禁用");
+
+    // 发布确认状态消息到服务器
+    String statusMessage;
+    statusMessage += "{\"enabled\":";
+    statusMessage += scheduleEnabled ? "true" : "false";
+    statusMessage += "}";
+    mqttClient.publish(mqttStatusTopic, statusMessage.c_str());
+    Serial.println("📤 已发布状态确认消息");
+
+    return;
+  }
+
+  // 处理空调控制指令
   StaticJsonDocument<64> doc;
   DeserializationError error = deserializeJson(doc, payload, length);
 
@@ -257,6 +286,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 // MQTT 任务函数 - 在独立任务中运行，不阻塞主循环
 void mqttTask(void *pvParameters) {
   Serial.println("📡 MQTT任务启动...");
+
+  // 将MQTT任务添加到看门狗
+  esp_task_wdt_add(NULL);
+
   mqttClient.setServer(mqttServer, mqttPort);
   mqttClient.setCallback(mqttCallback);
   mqttClient.setSocketTimeout(5000);  // 5秒超时
@@ -269,6 +302,9 @@ void mqttTask(void *pvParameters) {
   bool lastWiFiStatus = false;
 
   while (1) {
+    // MQTT任务也要定期喂狗
+    esp_task_wdt_reset();
+
     bool currentWiFiStatus = (WiFi.status() == WL_CONNECTED);
 
     // 只在WiFi状态变化时打印日志
@@ -285,6 +321,8 @@ void mqttTask(void *pvParameters) {
           Serial.println(" ✅ 已连接");
           mqttClient.subscribe(mqttTopic);
           Serial.printf("   订阅主题: %s\n", mqttTopic);
+          mqttClient.subscribe(mqttScheduleTopic);
+          Serial.printf("   订阅主题: %s\n", mqttScheduleTopic);
         } else {
           int state = mqttClient.state();
           Serial.print(" ❌ 失败 (状态: ");
@@ -313,7 +351,7 @@ void mqttTask(void *pvParameters) {
 
     lastWiFiStatus = currentWiFiStatus;
 
-    // 每5秒检查一次
+    // 每5秒检查一次（避免看门狗超时）
     vTaskDelay(pdMS_TO_TICKS(5000));
   }
 }
@@ -333,8 +371,13 @@ void initIRModule() {
 void sendIRCommand(const char* command) {
   Serial.printf("📤 发送红外命令: %s\n", command);
   IR_SERIAL.println(command);
-  delay(500);
-  
+
+  // 分段延时并喂狗，避免长时间阻塞
+  for (int i = 0; i < 5; i++) {
+    delay(100);
+    esp_task_wdt_reset();
+  }
+
   // 读取红外模块响应
   if (IR_SERIAL.available()) {
     String response = IR_SERIAL.readString();
@@ -377,11 +420,17 @@ void handleNotFound() {
 
 // 空调自动控制逻辑
 void checkACControl(int weekday, int hour, int minute, float temperature) {
+  // 检查定时开关状态
+  if (!scheduleEnabled) {
+    // 定时空调已禁用，不执行自动控制
+    return;
+  }
+
   // weekday: 0=周日, 1=周一, ..., 6=周六
-  
+
   // 判断是否在工作日（周一到周五）
   bool isWorkday = (weekday >= 1 && weekday <= 5);
-  
+
   if (!isWorkday) {
     // 周末不做自动控制
     return;
@@ -398,7 +447,7 @@ void checkACControl(int weekday, int hour, int minute, float temperature) {
       Serial.printf("🕗 早上8点，温度%.1f°C，不需要开启空调\n", temperature);
     }
   }
-  
+
   // 下午 17:30：无论空调是否开启，都发送关机命令
   if (hour == 17 && minute == 30) {
     Serial.println("🕕 下午5:30，准备关闭空调...");
@@ -452,11 +501,15 @@ void updateClock() {
   String weekdayStr = weekdayStrs[weekday % 7];
 
   // 检查空调控制（每分钟检查一次）
-  if (seconds == 0 && !lastACCommandSent) {
-    float temp = dht.readTemperature();
-    if (!isnan(temp)) {
-      checkACControl(weekday, hours, minutes, temp);
-    }
+  // 注意：不在这里读取DHT22，避免重复读取导致超时
+  // 使用updateTempHumi中读取的值
+  if (seconds == 0 && !lastACCommandSent && temperatureCacheValid) {
+    checkACControl(weekday, hours, minutes, cachedTemperature);
+  }
+
+  // 重置有效性标志（每分钟重置，强制等待新的温度读数）
+  if (seconds == 0) {
+    temperatureCacheValid = false;
   }
 
   // 重置命令标志（每分钟重置一次）
@@ -494,36 +547,23 @@ void updateClock() {
   if (seconds != lastSeconds) {
     // 格式化时间
     String timeStr = formatNumber(hours) + ":" + formatNumber(minutes) + ":" + formatNumber(seconds);
-    static String lastTimeStr = "";
-    static bool timeFontSet = false;  // 标记字体是否已设置
 
-    // 只有时间字符串变化时才重绘（避免同一秒内重复刷新）
-    if (timeStr != lastTimeStr) {
-      // 首次需要初始化u8g2和设置字体
-      if (!timeFontSet) {
-        u8g2.begin(tft);
-        u8g2.setFont(u8g2_font_logisoso26_tn);
-        timeFontSet = true;
-      }
+    // 清除整个时间区域（从y=82到y=150）
+    tft.fillRect(10, 82, 220, 68, ST77XX_BLACK);
 
-      // 计算秒数的位置（大约在时间字符串的右侧）
-      // 时间格式 HH:MM:SS，秒数占最后2位
-      int timeStrWidth = u8g2.getUTF8Width(timeStr.c_str());
-      int totalWidth = 220;  // 时间区域总宽度
-      int timeX = 10 + (totalWidth - timeStrWidth) / 2;
-      int timeY = 92 + 30 + 12;  // 垂直居中（考虑字体基线）
+    // 初始化u8g2并设置字体（每次都需要重新设置）
+    u8g2.begin(tft);
+    u8g2.setFont(u8g2_font_logisoso38_tn);  // 使用38号大字体
+    u8g2.setForegroundColor(ST77XX_WHITE);
+    u8g2.setBackgroundColor(ST77XX_BLACK);
 
-      // 清除秒数区域（大约清除右边30像素）
-      int clearX = timeX + timeStrWidth - 50;
-      int clearWidth = 50;
-      if (clearX < 10) clearX = 10;
-      tft.fillRect(clearX, 92, clearWidth, 60, ST77XX_BLACK);
+    // 计算时间位置（居中显示）
+    int timeStrWidth = u8g2.getUTF8Width(timeStr.c_str());
+    int totalWidth = 220;  // 时间区域总宽度
+    int timeX = 10 + (totalWidth - timeStrWidth) / 2;
+    int timeY = 130;  // 垂直居中位置
 
-      u8g2.setForegroundColor(ST77XX_WHITE);
-      u8g2.drawUTF8(timeX, timeY, timeStr.c_str());
-
-      lastTimeStr = timeStr;
-    }
+    u8g2.drawUTF8(timeX, timeY, timeStr.c_str());
 
     lastSeconds = seconds;
   }
@@ -539,6 +579,7 @@ void updateTempHumi() {
 
   if (isnan(humidity) || isnan(temperature)) {
     Serial.println("❌ DHT22读取错误!");
+    temperatureCacheValid = false;
     // 清除整个温湿度区域（包括竖线位置）
     tft.fillRect(10, 162, 220, 70, ST77XX_BLACK);
     u8g2.begin(tft);
@@ -551,6 +592,10 @@ void updateTempHumi() {
     u8g2.drawUTF8(error_x, error_y, errorStr.c_str());
     return;
   }
+
+  // 更新温度缓存
+  cachedTemperature = temperature;
+  temperatureCacheValid = true;
 
   // 动态颜色
   uint16_t tempColor = ST77XX_YELLOW;
@@ -776,7 +821,12 @@ void loop() {
     if (currentTime - lastUploadTime >= uploadInterval) {
       lastUploadTime = currentTime;
       feedWatchdog();
-      uploadData(dht.readTemperature(), dht.readHumidity());
+      // 使用缓存的温度值，避免重复读取
+      if (temperatureCacheValid) {
+        uploadData(cachedTemperature, dht.readHumidity());
+      } else {
+        Serial.println("⚠️ 温度缓存无效，跳过上传");
+      }
     }
   }
 
