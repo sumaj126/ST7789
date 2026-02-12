@@ -104,6 +104,7 @@ unsigned long systemUptime = 0;
 bool acIsOn = false;  // 空调是否开启
 bool lastACCommandSent = false;  // 上次是否发送过空调命令
 bool scheduleEnabled = true;  // 定时空调开关状态（默认启用）
+unsigned long lastScheduleStatusReport = 0;  // 上次上报定时空调状态的时间
 
 // 温度缓存（用于空调控制，避免重复读取DHT22）
 float cachedTemperature = 0;
@@ -346,6 +347,17 @@ void mqttTask(void *pvParameters) {
         }
       } else {
         mqttClient.loop();  // 处理MQTT消息
+
+        // 每60秒上报一次定时空调状态
+        if (millis() - lastScheduleStatusReport > 60000) {
+          String statusMessage;
+          statusMessage += "{\"enabled\":";
+          statusMessage += scheduleEnabled ? "true" : "false";
+          statusMessage += "}";
+          mqttClient.publish(mqttStatusTopic, statusMessage.c_str());
+          lastScheduleStatusReport = millis();
+          Serial.printf("📤 定期上报定时空调状态: %s\n", scheduleEnabled ? "启用" : "禁用");
+        }
       }
     }
 

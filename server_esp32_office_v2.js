@@ -2,6 +2,7 @@ const http = require('http');
 
 let latestData = { temperature: 0, humidity: 0, timestamp: 0 };
 let scheduleStatus = { enabled: true, lastUpdate: 0 };
+let lastScheduleCommandTime = 0; // 记录最后发送定时空调命令的时间
 
 // MQTT客户端配置
 const mqtt = require('mqtt');
@@ -15,9 +16,19 @@ mqttClient.on('connect', () => {
 mqttClient.on('message', (topic, message) => {
   if (topic === 'office/ac/schedule/status') {
     const data = JSON.parse(message.toString());
-    scheduleStatus.enabled = data.enabled;
-    scheduleStatus.lastUpdate = Date.now();
-    console.log('收到定时空调状态:', data);
+    const now = Date.now();
+
+    // 如果是在用户操作后的30秒内，优先接受ESP32的确认
+    if (now - lastScheduleCommandTime < 30000) {
+      scheduleStatus.enabled = data.enabled;
+      scheduleStatus.lastUpdate = now;
+      console.log('收到定时空调状态确认:', data);
+    } else {
+      // ESP32的定期上报（每60秒）
+      // 只更新时间戳，不覆盖用户手动设置的enabled状态
+      scheduleStatus.lastUpdate = now;
+      console.log('收到ESP32定期心跳上报，保持当前状态:', scheduleStatus.enabled);
+    }
   }
 });
 
@@ -84,6 +95,9 @@ const server = http.createServer((req, res) => {
         // 立即更新服务器端状态
         scheduleStatus.enabled = enabled;
         scheduleStatus.lastUpdate = Date.now();
+
+        // 记录发送命令的时间
+        lastScheduleCommandTime = Date.now();
 
         // 发送MQTT消息给ESP32
         mqttClient.publish('office/ac/schedule/enabled', JSON.stringify({ enabled: enabled }));
