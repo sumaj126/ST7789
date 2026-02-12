@@ -529,10 +529,14 @@ void updateClock() {
     lastACCommandSent = false;
   }
 
-  // 日期和星期显示（分两行显示）
+    // 日期和星期显示（分两行显示）
   static String lastDateNum = "";
   static String lastWeekday = "";
+  static String lastHours = "";
+  static String lastMinutes = "";
   String dateNum = String(year) + "-" + formatNumber(month) + "-" + formatNumber(day);
+  String hoursStr = formatNumber(hours);
+  String minutesStr = formatNumber(minutes);
 
   if (dateNum != lastDateNum || weekdayStr != lastWeekday) {
     u8g2.begin(tft);  // 只在日期变化时初始化
@@ -555,27 +559,57 @@ void updateClock() {
     lastWeekday = weekdayStr;
   }
 
-  // 时间显示（优化：只重绘秒数区域）
+  // 时间显示（优化：只重绘变化的部分）
   if (seconds != lastSeconds) {
-    // 格式化时间
-    String timeStr = formatNumber(hours) + ":" + formatNumber(minutes) + ":" + formatNumber(seconds);
-
-    // 清除整个时间区域（从y=82到y=150）
-    tft.fillRect(10, 82, 220, 68, ST77XX_BLACK);
-
-    // 初始化u8g2并设置字体（每次都需要重新设置）
     u8g2.begin(tft);
     u8g2.setFont(u8g2_font_logisoso38_tn);  // 使用38号大字体
     u8g2.setForegroundColor(ST77XX_WHITE);
     u8g2.setBackgroundColor(ST77XX_BLACK);
 
-    // 计算时间位置（居中显示）
-    int timeStrWidth = u8g2.getUTF8Width(timeStr.c_str());
-    int totalWidth = 220;  // 时间区域总宽度
-    int timeX = 10 + (totalWidth - timeStrWidth) / 2;
-    int timeY = 130;  // 垂直居中位置
+    String secondsStr = formatNumber(seconds);
 
-    u8g2.drawUTF8(timeX, timeY, timeStr.c_str());
+    // 如果小时或分钟变化，重绘整个时间
+    if (hoursStr != lastHours || minutesStr != lastMinutes) {
+      String timeStr = hoursStr + ":" + minutesStr + ":" + secondsStr;
+
+      // 清除整个时间区域
+      tft.fillRect(10, 82, 220, 68, ST77XX_BLACK);
+
+      // 计算时间位置（居中显示）
+      int timeStrWidth = u8g2.getUTF8Width(timeStr.c_str());
+      int totalWidth = 220;  // 时间区域总宽度
+      int timeX = 10 + (totalWidth - timeStrWidth) / 2;
+      int timeY = 130;  // 垂直居中位置
+
+      u8g2.drawUTF8(timeX, timeY, timeStr.c_str());
+
+      lastHours = hoursStr;
+      lastMinutes = minutesStr;
+    } else {
+      // 只清除和重绘秒数部分
+      // 先计算完整时间的宽度，确定秒数的位置
+      String fullTimeStr = hoursStr + ":" + minutesStr + ":" + secondsStr;
+      int fullTimeWidth = u8g2.getUTF8Width(fullTimeStr.c_str());
+      int totalWidth = 220;
+      int fullTimeX = 10 + (totalWidth - fullTimeWidth) / 2;
+
+      // 计算冒号和秒数部分的位置
+      String prefixStr = hoursStr + ":" + minutesStr + ":";
+      int prefixWidth = u8g2.getUTF8Width(prefixStr.c_str());
+      int secondsX = fullTimeX + prefixWidth;
+
+      // 计算当前秒数和上次秒数的宽度，取最大值
+      String lastSecondsStr = formatNumber(lastSeconds);
+      int currentSecondsWidth = u8g2.getUTF8Width(secondsStr.c_str());
+      int lastSecondsWidth = u8g2.getUTF8Width(lastSecondsStr.c_str());
+      int clearWidth = max(currentSecondsWidth, lastSecondsWidth) + 15;  // 增加清除宽度
+
+      // 清除更宽的秒数区域，确保完全覆盖
+      tft.fillRect(secondsX - 5, 82, clearWidth, 68, ST77XX_BLACK);
+
+      // 重绘秒数
+      u8g2.drawUTF8(secondsX, 130, secondsStr.c_str());
+    }
 
     lastSeconds = seconds;
   }
