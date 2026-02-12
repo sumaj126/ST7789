@@ -81,7 +81,11 @@ const server = http.createServer((req, res) => {
         const data = JSON.parse(body);
         const enabled = data.enabled;
 
-        // 发送MQTT消息
+        // 立即更新服务器端状态
+        scheduleStatus.enabled = enabled;
+        scheduleStatus.lastUpdate = Date.now();
+
+        // 发送MQTT消息给ESP32
         mqttClient.publish('office/ac/schedule/enabled', JSON.stringify({ enabled: enabled }));
 
         console.log(`定时空调控制: ${enabled ? '启用' : '禁用'}`);
@@ -157,7 +161,7 @@ const server = http.createServer((req, res) => {
     @media (max-width: 480px) { .container { padding: 20px; } .title { font-size: 24px; } .time-display { font-size: 36px; } .data-card { padding: 15px; text-align: center; } .data-value { font-size: 32px; text-align: center; } .ac-btn { font-size: 16px; padding: 15px; } }
   </style>
   <script>
-    let scheduleEnabled = true;
+    let scheduleEnabled = ${scheduleStatus.enabled};
     let scheduleConfirmed = true; // 是否已确认
 
     function updateTime() {
@@ -277,7 +281,7 @@ const server = http.createServer((req, res) => {
       try {
         const response = await fetch('/api/status');
         const data = await response.json();
-        if (Date.now() - data.lastUpdate < 10000) { // 10秒内的状态才有效
+        if (Date.now() - data.lastUpdate < 60000) { // 60秒内的状态才有效
           scheduleEnabled = data.enabled;
           document.getElementById('scheduleSwitch').checked = scheduleEnabled;
         }
@@ -330,7 +334,7 @@ const server = http.createServer((req, res) => {
       <div class="schedule-toggle">
         <span class="switch-label">启用定时空调</span>
         <label class="toggle-switch">
-          <input type="checkbox" id="scheduleSwitch" checked onchange="toggleSchedule()">
+          <input type="checkbox" id="scheduleSwitch" ${scheduleStatus.enabled ? 'checked' : ''} onchange="toggleSchedule()">
           <span class="slider"></span>
         </label>
       </div>
